@@ -7,8 +7,9 @@ export const dynamic = "force-dynamic";
 
 /**
  * Collector trigger endpoint. Called every minute by the scheduler (see
- * .github/workflows/collect.yml) — this is the ONLY thing that writes to
- * parking_observations.
+ * .github/workflows/collect.yml, or an external pinger such as
+ * cron-job.org if GitHub's own schedule hasn't activated) — this is the
+ * ONLY thing that writes to parking_observations.
  *
  * Auth: requires "Authorization: Bearer <CRON_SECRET>". Without a valid
  * secret this refuses to run, so it can't be abused as a public trigger
@@ -19,6 +20,17 @@ export const dynamic = "force-dynamic";
  * anyway, but this is a second, authoritative guard against clock drift,
  * manual curls, or a misconfigured scheduler). Pass ?force=true to bypass
  * the window check for manual testing.
+ *
+ * Also refreshes the aggregated materialized views (see
+ * db/migrations/002_materialized_views.sql) after every successful
+ * collection. Doing this on every write does duplicate the dedicated
+ * "Refresh aggregated stats" schedule (.github/workflows/refresh-views.yml)
+ * — that's intentional short-term redundancy: at current data volume
+ * (hundreds to low thousands of rows) a concurrent refresh is cheap, and
+ * it removes the dependency on a second scheduler activating. Once the
+ * historical table is large enough that refreshing every minute is
+ * measurably expensive, drop this call and rely solely on the dedicated
+ * lower-frequency schedule instead.
  */
 export async function POST(req: NextRequest) {
   const expected = process.env.CRON_SECRET;
@@ -50,10 +62,17 @@ export async function POST(req: NextRequest) {
   const supabase = getServiceClient();
   const result = await runCollection(supabase);
 
+  let viewRefreshError: string | null = null;
+  if (result.success) {
+    const { error } = await supabase.rpc("refresh_deck_stats");
+    if (error) viewRefreshError = error.message;
+  }
+
   return NextResponse.json({
     ranAt: now.toISOString(),
     withinWindow: true,
     skipped: false,
     result,
+    ...(viewRefreshError ? { viewRefreshError } : {}),
   });
 }
