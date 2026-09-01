@@ -47,3 +47,4 @@ jobs:
         env:
           APP_URL: ${{ secrets.APP_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+# Nudge GitHub Actions to register the cron schedule
