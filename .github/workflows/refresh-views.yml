@@ -1,0 +1,31 @@
+name: Refresh aggregated stats
+
+# Keeps deck_weekday_minute_stats / deck_weekday_coverage (what every
+# historical-average feature reads from) reasonably fresh without
+# recomputing them on every single collection tick. Runs every 15 minutes,
+# all week — cheap and idempotent, so there's no harm running it outside
+# the collection window too.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: POST /api/refresh-views
+        run: |
+          http_status=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST "${APP_URL}/api/refresh-views" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            --max-time 60)
+          echo "HTTP $http_status"
+          cat /tmp/response.json
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            exit 1
+          fi
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
