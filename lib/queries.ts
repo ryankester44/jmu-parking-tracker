@@ -26,30 +26,54 @@ export async function getDeckLatest(supabase: ServiceClient): Promise<DeckLatest
   return data ?? [];
 }
 
-// Supabase/PostgREST caps a response at 1000 rows by default unless a
-// wider .range() is requested — silently, with no error. A single day's
-// observations (COLLECTION window minutes x deck count) or a weekday's
-// aggregated stats can both exceed that once enough of the day/week has
-// been collected, which truncated "Today's Parking" partway through the
-// afternoon in production. 20000 comfortably covers 841 minutes x dozens
-// of decks, far beyond the current 5.
-const MAX_ROWS_PER_QUERY = 20000;
+// Supabase's PostgREST layer hard-caps a single response's row count
+// (project setting "Max Rows," 1000 by default) REGARDLESS of a wider
+// .range() being requested — silently, no error. A single day's
+// observations (deck count x up to 841 minutes) or a weekday's aggregated
+// stats can both exceed that once enough of the day/week has been
+// collected, which silently truncated "Today's Parking" partway through
+// the afternoon in production even after widening the requested range.
+// The only fix that doesn't depend on a project setting neither of us can
+// change from here is to paginate explicitly and keep requesting pages
+// until a short page signals the end.
+const PAGE_SIZE = 1000;
+// Safety bound on iterations, not an expected case — current queries top
+// out around 5 decks x 841 minutes = ~4205 rows (5 pages).
+const MAX_PAGES = 50;
+
+type PageResult<T> = { data: T[] | null; error: { message: string } | null };
+
+async function fetchAllPages<T>(
+  label: string,
+  buildQuery: (from: number, to: number) => PromiseLike<PageResult<T>>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const from = page * PAGE_SIZE;
+    const { data, error } = await buildQuery(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`${label}: ${error.message}`);
+    const rows = data ?? [];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
 
 /** Full-resolution per-minute observations for one local calendar date, across all active decks. */
 export async function getObservationsForDate(
   supabase: ServiceClient,
   localDate: string,
 ) {
-  const { data, error } = await supabase
-    .from("parking_observations")
-    .select("deck_id, minute_of_day, observed_at, available_spaces, status")
-    .eq("local_date", localDate)
-    .gte("minute_of_day", COLLECTION_START_MINUTE)
-    .lte("minute_of_day", COLLECTION_END_MINUTE)
-    .order("minute_of_day", { ascending: true })
-    .range(0, MAX_ROWS_PER_QUERY - 1);
-  if (error) throw new Error(`getObservationsForDate: ${error.message}`);
-  return data ?? [];
+  return fetchAllPages("getObservationsForDate", (from, to) =>
+    supabase
+      .from("parking_observations")
+      .select("deck_id, minute_of_day, observed_at, available_spaces, status")
+      .eq("local_date", localDate)
+      .gte("minute_of_day", COLLECTION_START_MINUTE)
+      .lte("minute_of_day", COLLECTION_END_MINUTE)
+      .order("minute_of_day", { ascending: true })
+      .range(from, to),
+  );
 }
 
 /** Per-minute weekday averages for one or more decks, from the pre-aggregated materialized view. */
@@ -57,16 +81,16 @@ export async function getWeekdayMinuteStats(
   supabase: ServiceClient,
   weekday: number,
 ): Promise<DeckStatRow[]> {
-  const { data, error } = await supabase
-    .from("deck_weekday_minute_stats")
-    .select("*")
-    .eq("day_of_week", weekday)
-    .gte("minute_of_day", COLLECTION_START_MINUTE)
-    .lte("minute_of_day", COLLECTION_END_MINUTE)
-    .order("minute_of_day", { ascending: true })
-    .range(0, MAX_ROWS_PER_QUERY - 1);
-  if (error) throw new Error(`getWeekdayMinuteStats: ${error.message}`);
-  return data ?? [];
+  return fetchAllPages("getWeekdayMinuteStats", (from, to) =>
+    supabase
+      .from("deck_weekday_minute_stats")
+      .select("*")
+      .eq("day_of_week", weekday)
+      .gte("minute_of_day", COLLECTION_START_MINUTE)
+      .lte("minute_of_day", COLLECTION_END_MINUTE)
+      .order("minute_of_day", { ascending: true })
+      .range(from, to),
+  );
 }
 
 export interface CoverageRow {
