@@ -26,6 +26,15 @@ export async function getDeckLatest(supabase: ServiceClient): Promise<DeckLatest
   return data ?? [];
 }
 
+// Supabase/PostgREST caps a response at 1000 rows by default unless a
+// wider .range() is requested — silently, with no error. A single day's
+// observations (COLLECTION window minutes x deck count) or a weekday's
+// aggregated stats can both exceed that once enough of the day/week has
+// been collected, which truncated "Today's Parking" partway through the
+// afternoon in production. 20000 comfortably covers 841 minutes x dozens
+// of decks, far beyond the current 5.
+const MAX_ROWS_PER_QUERY = 20000;
+
 /** Full-resolution per-minute observations for one local calendar date, across all active decks. */
 export async function getObservationsForDate(
   supabase: ServiceClient,
@@ -37,7 +46,8 @@ export async function getObservationsForDate(
     .eq("local_date", localDate)
     .gte("minute_of_day", COLLECTION_START_MINUTE)
     .lte("minute_of_day", COLLECTION_END_MINUTE)
-    .order("minute_of_day", { ascending: true });
+    .order("minute_of_day", { ascending: true })
+    .range(0, MAX_ROWS_PER_QUERY - 1);
   if (error) throw new Error(`getObservationsForDate: ${error.message}`);
   return data ?? [];
 }
@@ -53,7 +63,8 @@ export async function getWeekdayMinuteStats(
     .eq("day_of_week", weekday)
     .gte("minute_of_day", COLLECTION_START_MINUTE)
     .lte("minute_of_day", COLLECTION_END_MINUTE)
-    .order("minute_of_day", { ascending: true });
+    .order("minute_of_day", { ascending: true })
+    .range(0, MAX_ROWS_PER_QUERY - 1);
   if (error) throw new Error(`getWeekdayMinuteStats: ${error.message}`);
   return data ?? [];
 }
