@@ -2,6 +2,7 @@ import type { ServiceClient } from "./supabase/server";
 import { fetchJmuFeed, interpretZoneReading } from "./jmu-source";
 import { truncateToMinute } from "./time";
 import type { DeckRow, ObservationStatus } from "./types";
+import { detectTransientZeroGlitch, MAX_GLITCH_RUN_MINUTES, type HistoryPoint } from "./anomaly";
 
 export interface CollectionResult {
   success: boolean;
@@ -26,7 +27,55 @@ export interface CollectionResult {
  *   - Partial failure (feed responded, but a specific zone is missing or
  *     unparseable): that deck gets a row with available_spaces = NULL and
  *     status set accordingly; other decks in the same run are unaffected.
+ *   - Transient feed glitch (JMU's own site briefly reports 0 for a deck
+ *     that's actually nowhere near full, then recovers): can't be caught
+ *     at write-time (we don't know it'll recover until the NEXT good
+ *     reading arrives), so this is healed retroactively — see
+ *     healTransientZeroGlitch() below, called once per deck whenever a
+ *     positive reading arrives, in case it's the "recovery" from an
+ *     as-yet-uncorrected dip. Confirmed against a real incident
+ *     (2026-09-07, decks 1 & 3, 4 straight minutes at 0 then back to
+ *     within a few spaces of the pre-drop value) — see lib/anomaly.ts.
  */
+const DECK_FETCH_MAX_ATTEMPTS = 3;
+const DECK_FETCH_RETRY_DELAYS_MS = [300, 800];
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The parking_decks lookup is a trivial 5-row query, but a sample of
+ * production collection_runs (2026-09-14, 11:00-12:00 UTC) showed it
+ * failing outright ~27% of the time during the 7-9am ET window, every
+ * failure stalling for a near-identical ~5s before erroring — the
+ * signature of transient connection/pool contention, not a real data
+ * problem. That single failure used to blank out the entire minute (no
+ * observation rows written at all, on ALL 5 decks) even though the
+ * feed fetch right after it would very likely have succeeded. Retrying
+ * a couple of times with a short backoff costs at most ~1.1s and turns
+ * most of those into a normal successful run instead of a data gap.
+ */
+async function fetchActiveDecksWithRetry(supabase: ServiceClient) {
+  let last: Awaited<ReturnType<typeof queryActiveDecks>> | null = null;
+  for (let attempt = 0; attempt < DECK_FETCH_MAX_ATTEMPTS; attempt++) {
+    last = await queryActiveDecks(supabase);
+    if (!last.error && last.data && last.data.length > 0) return last;
+    const delay = DECK_FETCH_RETRY_DELAYS_MS[attempt];
+    if (delay !== undefined) {
+      await sleep(delay);
+    }
+  }
+  return last!;
+}
+
+function queryActiveDecks(supabase: ServiceClient) {
+  return supabase
+    .from("parking_decks")
+    .select("id, slug, display_name, zone_id, sort_order, active, capacity, capacity_source, capacity_note")
+    .eq("active", true);
+}
+
 export async function runCollection(
   supabase: ServiceClient,
 ): Promise<CollectionResult> {
@@ -34,10 +83,7 @@ export async function runCollection(
   const observedAt = truncateToMinute(new Date());
   const observedAtIso = observedAt.toISOString();
 
-  const { data: decks, error: decksError } = await supabase
-    .from("parking_decks")
-    .select("id, slug, display_name, zone_id, sort_order, active, capacity, capacity_source, capacity_note")
-    .eq("active", true);
+  const { data: decks, error: decksError } = await fetchActiveDecksWithRetry(supabase);
 
   if (decksError || !decks || decks.length === 0) {
     await logRun(supabase, {
@@ -155,6 +201,14 @@ export async function runCollection(
   // a new one arrived.
   await supabase.from("deck_latest").upsert(latestRows, { onConflict: "deck_id" });
 
+  // Any deck that just posted a positive reading might be the "recovery"
+  // side of a transient zero-glitch a few minutes back — check and heal.
+  for (const row of observationRows) {
+    if (row.status === "ok" && row.available_spaces !== null && row.available_spaces > 0) {
+      await healTransientZeroGlitch(supabase, row.deck_id, row.available_spaces, observedAtIso);
+    }
+  }
+
   await logRun(supabase, {
     success: true,
     decksOk,
@@ -170,6 +224,47 @@ export async function runCollection(
     errorMessage: null,
     observedAt: observedAtIso,
   };
+}
+
+/**
+ * Looks back at this deck's recent readings (strictly before the newest
+ * one) for a transient zero-glitch pattern, and if found, retroactively
+ * corrects those rows to available_spaces = NULL, status = 'invalid'.
+ * See detectTransientZeroGlitch's docstring for why this can only be
+ * decided after the fact, once a recovery reading is in hand.
+ */
+async function healTransientZeroGlitch(
+  supabase: ServiceClient,
+  deckId: number,
+  newValue: number,
+  beforeObservedAtIso: string,
+): Promise<void> {
+  const { data: recent } = await supabase
+    .from("parking_observations")
+    .select("observed_at, available_spaces, status")
+    .eq("deck_id", deckId)
+    .lt("observed_at", beforeObservedAtIso)
+    .order("observed_at", { ascending: false })
+    .limit(MAX_GLITCH_RUN_MINUTES + 1);
+
+  if (!recent || recent.length === 0) return;
+
+  const oldestFirst = [...recent].reverse();
+  const priorHistory: HistoryPoint[] = oldestFirst.map((r) => ({
+    value: r.available_spaces,
+    status: r.status as ObservationStatus,
+  }));
+
+  const runLength = detectTransientZeroGlitch(priorHistory, newValue);
+  if (runLength === 0) return;
+
+  const timestampsToFix = oldestFirst.slice(oldestFirst.length - runLength).map((r) => r.observed_at);
+
+  await supabase
+    .from("parking_observations")
+    .update({ available_spaces: null, status: "invalid" })
+    .eq("deck_id", deckId)
+    .in("observed_at", timestampsToFix);
 }
 
 async function logRun(

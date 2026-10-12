@@ -24,15 +24,30 @@ interface RecordedCall {
   options?: unknown;
 }
 
-function makeFakeSupabase(opts: { upsertError?: { message: string } } = {}) {
+function makeFakeSupabase(
+  opts: { upsertError?: { message: string }; decksFailuresBeforeSuccess?: number } = {},
+) {
   const calls: RecordedCall[] = [];
+  let decksAttempts = 0;
 
   const client = {
     from(table: string) {
       if (table === "parking_decks") {
         return {
           select() {
-            return { eq: () => Promise.resolve({ data: FAKE_DECKS, error: null }) };
+            return {
+              eq: () => {
+                decksAttempts++;
+                const failuresLeft = opts.decksFailuresBeforeSuccess ?? 0;
+                if (decksAttempts <= failuresLeft) {
+                  return Promise.resolve({
+                    data: null,
+                    error: { message: "connection timed out" },
+                  });
+                }
+                return Promise.resolve({ data: FAKE_DECKS, error: null });
+              },
+            };
           },
         };
       }
@@ -41,6 +56,23 @@ function makeFakeSupabase(opts: { upsertError?: { message: string } } = {}) {
           upsert(rows: unknown, options: unknown) {
             calls.push({ table, method: "upsert", payload: rows, options });
             return Promise.resolve({ error: table === "parking_observations" ? (opts.upsertError ?? null) : null });
+          },
+          // Used by healTransientZeroGlitch's lookback query. No prior
+          // history in these tests, so it always resolves empty, which
+          // makes detectTransientZeroGlitch a no-op — the healing path
+          // itself is covered by anomaly.test.ts.
+          select() {
+            const chain = {
+              eq: () => chain,
+              lt: () => chain,
+              order: () => chain,
+              limit: () => Promise.resolve({ data: [], error: null }),
+            };
+            return chain;
+          },
+          update(payload: unknown) {
+            calls.push({ table, method: "upsert", payload });
+            return { eq: () => ({ in: () => Promise.resolve({ error: null }) }) };
           },
         };
       }
@@ -56,7 +88,11 @@ function makeFakeSupabase(opts: { upsertError?: { message: string } } = {}) {
     },
   };
 
-  return { client: client as unknown as ServiceClient, calls };
+  return {
+    client: client as unknown as ServiceClient,
+    calls,
+    getDecksAttempts: () => decksAttempts,
+  };
 }
 
 const mockedFetch = vi.mocked(fetchJmuFeed);
@@ -119,6 +155,50 @@ describe("runCollection — partial failure", () => {
     const ballardRow = obsRows.find((r) => r.deck_id === 1)!;
     expect(ballardRow.available_spaces).toBe(1298);
     expect(ballardRow.status).toBe("ok");
+  });
+});
+
+describe("runCollection — transient deck-lookup failure", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("retries the deck registry lookup and still succeeds after one transient failure", async () => {
+    mockedFetch.mockResolvedValueOnce({
+      asOf: "2026-08-31 18:33:22",
+      counts: new Map([
+        ["22", "100"],
+        ["13", "100"],
+        ["19", "100"],
+        ["54", "100"],
+        ["42", "100"],
+      ]),
+    });
+    const { client, calls, getDecksAttempts } = makeFakeSupabase({ decksFailuresBeforeSuccess: 1 });
+
+    const resultPromise = runCollection(client);
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(getDecksAttempts()).toBe(2);
+    expect(result.success).toBe(true);
+    expect(result.decksOk).toBe(5);
+    expect(calls.filter((c) => c.table === "parking_observations")).toHaveLength(1);
+  });
+
+  it("gives up and logs a real failure (no fabricated data) if every retry fails", async () => {
+    const { client, calls, getDecksAttempts } = makeFakeSupabase({ decksFailuresBeforeSuccess: 99 });
+
+    const resultPromise = runCollection(client);
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(getDecksAttempts()).toBe(3); // 1 initial + 2 retries, then gives up
+    expect(result.success).toBe(false);
+    expect(calls.filter((c) => c.table === "parking_observations")).toHaveLength(0);
   });
 });
 
