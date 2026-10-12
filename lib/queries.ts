@@ -76,12 +76,48 @@ export async function getObservationsForDate(
   );
 }
 
+// GitHub Actions' scheduler occasionally misses a single collection
+// minute (best-effort timing — see README "Why GitHub Actions"). When
+// that happens, the raw per-minute average in deck_weekday_minute_stats
+// is built from one fewer day than its neighboring minutes, producing a
+// one-minute-wide notch in an otherwise smooth trend — most visible on
+// low-capacity decks, where one day's reading is a larger share of the
+// average. This smooths the DISPLAYED average with a small centered
+// window; it never touches raw parking_observations rows or the
+// materialized view itself, so sample_count/distinct_days/min/max/stddev
+// stay exact.
+const SMOOTHING_WINDOW_MINUTES = 2;
+
+function smoothAvgAvailableByDeck(rows: DeckStatRow[]): DeckStatRow[] {
+  const byDeckMinute = new Map<number, Map<number, DeckStatRow>>();
+  for (const row of rows) {
+    if (!byDeckMinute.has(row.deck_id)) byDeckMinute.set(row.deck_id, new Map());
+    byDeckMinute.get(row.deck_id)!.set(row.minute_of_day, row);
+  }
+
+  return rows.map((row) => {
+    const minuteMap = byDeckMinute.get(row.deck_id)!;
+    const windowVals: number[] = [];
+    for (
+      let m = row.minute_of_day - SMOOTHING_WINDOW_MINUTES;
+      m <= row.minute_of_day + SMOOTHING_WINDOW_MINUTES;
+      m++
+    ) {
+      const v = minuteMap.get(m)?.avg_available;
+      if (v !== null && v !== undefined) windowVals.push(Number(v));
+    }
+    const avg =
+      windowVals.length > 0 ? windowVals.reduce((a, b) => a + b, 0) / windowVals.length : null;
+    return { ...row, avg_available: avg };
+  });
+}
+
 /** Per-minute weekday averages for one or more decks, from the pre-aggregated materialized view. */
 export async function getWeekdayMinuteStats(
   supabase: ServiceClient,
   weekday: number,
 ): Promise<DeckStatRow[]> {
-  return fetchAllPages("getWeekdayMinuteStats", (from, to) =>
+  const rows = await fetchAllPages("getWeekdayMinuteStats", (from, to) =>
     supabase
       .from("deck_weekday_minute_stats")
       .select("*")
@@ -91,6 +127,7 @@ export async function getWeekdayMinuteStats(
       .order("minute_of_day", { ascending: true })
       .range(from, to),
   );
+  return smoothAvgAvailableByDeck(rows);
 }
 
 export interface CoverageRow {
