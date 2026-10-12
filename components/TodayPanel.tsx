@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { ChartLegend, TimeSeriesChart, type ChartRow, type ChartSeriesMeta } from "./TimeSeriesChart";
 import { todayLocalDate } from "@/lib/time";
 import { fetchApi, friendlyApiErrorMessage, type ApiError } from "@/lib/fetchJson";
@@ -17,11 +17,33 @@ interface DayApiResponse {
 const POLL_MS = 60_000;
 
 export function TodayPanel() {
-  const today = useMemo(() => todayLocalDate(), []);
+  const [today, setToday] = useState(() => todayLocalDate());
   const [date, setDate] = useState(today);
   const [data, setData] = useState<DayApiResponse | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
+
+  // `today` was previously computed once via useMemo(..., []) and never
+  // updated — if this page is left open in a browser tab past midnight (or
+  // just sits open for a while), that froze "today" at a stale date, and
+  // since the date picker's max={today} blocks anything later, the REAL
+  // current day became unselectable until a manual page refresh. Keeping
+  // this in sync on an interval (and whenever the tab regains focus) fixes
+  // that without requiring a reload.
+  useEffect(() => {
+    function sync() {
+      const current = todayLocalDate();
+      setToday((prev) => (prev === current ? prev : current));
+    }
+    const id = setInterval(sync, POLL_MS);
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
