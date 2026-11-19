@@ -91,6 +91,12 @@ export function TodayPanel() {
           Date
         </label>
         <input
+          // Remount whenever the valid range changes — some browsers cache
+          // the native date-picker's "jump to month" overlay range from
+          // first paint and never re-read a `max` that changes afterward,
+          // even across closing/reopening the popup. A fresh DOM node
+          // sidesteps that stale-widget bug entirely.
+          key={today}
           id="day-picker"
           type="date"
           value={date}
